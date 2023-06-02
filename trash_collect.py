@@ -46,7 +46,10 @@ class TrashCollect():
 
         self.sdk = bosdyn.client.create_standard_sdk('ArmTrajectory')
         self.robot = self.sdk.create_robot(options.hostname)
-        bosdyn.client.util.authenticate(self.robot)
+        #bosdyn.client.util.authenticate(self.robot)
+
+        self.robot.authenticate('user', 'wtwt9krypmps')
+
         self.robot.time_sync.wait_for_sync()
 
         assert not self.robot.is_estopped(), "Robot is estopped!"
@@ -80,6 +83,9 @@ class TrashCollect():
         self.left_buffer = None
         self.rear_buffer = None
         self.image_log_path = '/home/iemn/Desktop/folkemode/trash_collect/log/'
+
+        # Previous world pose buffer
+        self.prev_pose = None
 
     #####################################################################
     ####################### UTILITY FUNCTIONS ###########################
@@ -167,7 +173,6 @@ class TrashCollect():
         for i in range(len(images)):
             #corners, ids, _ = aruco.detectMarkers(images[i], aruco_dict, parameters=parameters)
             corners, ids, _ = self.aruco_detector.detectMarkers(images[i])
-            print(i, ":", ids)
             #try:
             if ids is None: # If no IDS are found
                 pass
@@ -270,7 +275,6 @@ class TrashCollect():
                     cv2.imwrite("FailToFind{}_Left_iter{}.png".format(ID, iterations), self.left_buffer)
                     cv2.imwrite("FailToFind{}_Right_iter{}.png".format(ID, iterations), self.right_buffer)
                     cv2.imwrite("FailToFind{}_Rear_iter{}.png".format(ID, iterations), self.rear_buffer)
-                    #print("ID search iterations: {}".format(iterations))
                 else:
                     id_found = True
             
@@ -369,18 +373,12 @@ class TrashCollect():
             while time.time()-start_t < t:
                 pass
 
-    def movej(self, q, t=5, deg=True):
+    def movej(self, q, t=5):
         """
         Rotates the joints with the specified angles (in radians). The trajectory is executed in the specified time in seconds, defaults to 5 seconds.
         """
         assert len(q)==6, "Invalid joint input!"
-        if deg == True:
-            radians = []
-            for angle in q:
-                radians.append(self.deg_to_rad(angle))
-            q1, q2, q3, q4, q5, q6 = radians
-        else:
-            q1, q2, q3, q4, q5, q6 = q
+        q1, q2, q3, q4, q5, q6 = q
 
         if type(q1) == wrappers_pb2.DoubleValue:
             arm_position = arm_command_pb2.ArmJointPosition(sh0=q1, 
@@ -448,13 +446,16 @@ class TrashCollect():
     def arm_object_grasp(self):
         self.g_image_click = None
         self.g_image_display = None
+        """
         image_sources = ['frontleft_fisheye_image',
                          'frontright_fisheye_image',
                          'left_fisheye_image',
                          'right_fisheye_image',
                          'back_fisheye_image']
+        """
+        image_source = 'hand_color_image'
 
-        image_responses = self.image_client.get_image_from_sources([image_sources[0]])
+        image_responses = self.image_client.get_image_from_sources([image_source])
 
         if len(image_responses) != 1:
             print('Got invalid number of images: ' + str(len(image_responses)))
@@ -495,6 +496,7 @@ class TrashCollect():
         self.add_grasp_constraint(grasp)
         grasp_request = manipulation_api_pb2.ManipulationApiRequest(pick_object_in_image=grasp)
         cmd_response = self.manipulation_api_client.manipulation_api_command(manipulation_api_request=grasp_request)
+        start_time = time.time()
         while True:
             feedback_request = manipulation_api_pb2.ManipulationApiFeedbackRequest(manipulation_cmd_id=cmd_response.manipulation_cmd_id)
             response = self.manipulation_api_client.manipulation_api_feedback_command(manipulation_api_feedback_request=feedback_request)
@@ -502,7 +504,21 @@ class TrashCollect():
                 return 1
             elif response.current_state == manipulation_api_pb2.MANIP_STATE_GRASP_FAILED:
                 return 0
+
+            gripper_pose = self.get_gripper_position()
+            if gripper_pose < 5.0:
+                return 0
+            
+            if time.time() - start_time > 10:
+                print("GRASP TIME EXCEEDED")
+                self.arm_gaze_pose()
+                return 0
+            
             time.sleep(0.25)
+
+    def get_gripper_position(self):
+        open_percentage = self.robot_state_client.get_robot_state().manipulator_state.gripper_open_percentage
+        return open_percentage
 
     def lock_arm_in_body(self):
         """
@@ -513,8 +529,83 @@ class TrashCollect():
         joint_positions = []
         for idx in arm_idx:
             joint_positions.append(joint_states[idx].position)
-        self.movej(joint_positions, t=1, deg=False)
+        self.movej(joint_positions, t=1)
         time.sleep(1.5)
+
+    def arm_gaze_pose(self):
+        """
+        zero pose:
+        value: 0.0004565715789794922
+        , value: -3.117290735244751
+        , value: 3.1388797760009766
+        , value: 1.5720899105072021
+        , value: -0.0005409717559814453
+        , value: -1.5700340270996094
+        """
+        arm_gaze_pose = [0.0, 
+                         -math.pi + (45.0*math.pi/180.0),
+                         math.pi - (45.0*math.pi/180.0),
+                         0.0,
+                         60.0*math.pi/180,
+                         0.0
+                         ]
+        self.open_gripper(1.0)
+        self.movej(arm_gaze_pose, 2)
+        time.sleep(2)
+
+    def gaze_on_ground(self):
+        self.arm_gaze_pose()
+
+        body_rotations = [45, -45, -45, 45]
+        object_found = False
+        while not object_found:
+            for angle in body_rotations:
+                self.rotate_body(angle, 3)
+                print("Enter 1 if object found:")
+                input_val = int(input())
+
+                if input_val == 1:
+                    self.prev_pose = self.get_body_tform_in_vision()
+
+                    object_found = True
+                    
+                    # RUN DIMITRIOS CLASS HERE INSTEAD OF THIS FUNCTION
+                    ret_val = self.arm_object_grasp()
+
+                    detected_class = 1
+                    if detected_class == 1: # If banana
+                        ID = 1
+                        s_offset1 = 0.7
+                        s_offset2 = 0.5
+                        arm_offset = -0.1
+                        rot_val = 135
+                        ret_arr = [ID, s_offset1, s_offset2, arm_offset, rot_val]
+                    elif detected_class == 2: # If bottle
+                        ID = 2
+                        s_offset1 = -0.7
+                        s_offset2 = -0.5
+                        arm_offset = 0.1
+                        rot_val = -135
+                        ret_arr = [ID, s_offset1, s_offset2, arm_offset, rot_val]
+
+                    if ret_val == 1:
+                        self.arm_retract_position()
+                        time.sleep(0.25)
+                        self.lock_arm_in_body()
+                        return ret_arr
+                    else:
+                        iterations = 1
+                        while ret_val == 0:
+                            if iterations > 3: # Allow Spot to try a grasp 3 times before giving up
+                                self.move_simple(self.prev_pose, 7)
+                                break
+
+                            ret_val = self.arm_object_grasp()
+                            iterations += 1
+
+
+                else:
+                    pass
 
 
 
@@ -529,35 +620,16 @@ class TrashCollect():
 
             self.init_spot()
 
-            i = 0
             while 1:
-                print("Enter 1 for banana, enter 2 for bottle:")
-                input_val = int(input())
+                ID, s_offset1, s_offset2, arm_offset, rot_val = self.gaze_on_ground()
 
-                if input_val == 1: # If banana
-                    ID = 1
-                    s_offset1 = 0.7
-                    s_offset2 = 0.5
-                    arm_offset = -0.1
-                    rot_val = 135
-                elif input_val == 2: # If bottle
-                    ID = 2
-                    s_offset1 = -0.7
-                    s_offset2 = -0.5
-                    arm_offset = 0.1
-                    rot_val = -135
-
-                # Show image, get input pixel and grasp item
-                grasp_success = self.arm_object_grasp()
-                # TODO: Add error handling when grasp fails
-                if not grasp_success:
-                    print("FAILED GRASP")
-                # If grasp is successful, carry it to trash bin
+                if ID == 0:
+                    # If the grasp was not successful 
+                    pass
                 else:
-                    # Retract arm from ground to carry position
-                    self.arm_retract_position()
-                    time.sleep(0.25)
-                    self.lock_arm_in_body()
+
+                    # TODO: Add error handling when grasp fails
+
                     # Move to corresponding trash bin and drop the item into it
                     self.move_to_aruco(ID, marker_size=self.aruco_size, dist_offset=0.7, side_offset=s_offset1)
                     time.sleep(0.25)
@@ -567,16 +639,16 @@ class TrashCollect():
                     #time.sleep(0.25)
                     self.arm_drop_position(arm_offset)
                     self.open_gripper(1.0)
-                    time.sleep(2)
+                    time.sleep(1)
                     self.open_gripper(0.0)
                     # Stow arm and return to "ready" pose
                     self.stow_arm()
                     
-                    self.move_to_aruco(ID, marker_size=self.aruco_size, dist_offset=0.7, side_offset=s_offset2, global_orientation=True)
+                    self.move_to_aruco(ID, marker_size=self.aruco_size, dist_offset=0.7, side_offset=s_offset1, global_orientation=True)
                     
-                    self.rotate_body(rot_val, 7)
+                    self.rotate_body(rot_val, 5)
 
-                    time.sleep(1)
+                    time.sleep(0.25)
 
 
 
